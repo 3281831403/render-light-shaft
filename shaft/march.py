@@ -22,6 +22,20 @@ __all__ = [
     "validate_shaft",
 ]
 
+_DEPTH_TOLERANCE = 1e-9
+_G_EPSILON = 1e-12
+
+
+def _hash01(seed: int, index: int) -> float:
+    """Deterministic pseudo-random value in ``[0, 1)`` from ``seed``/``index``.
+
+    A sine hash built on ``math`` only; the fractional part keeps the result
+    inside the half-open unit interval for any sign of the intermediate value.
+    """
+
+    x = math.sin(seed * 12.9898 + (index + 1) * 78.233) * 43758.5453
+    return x - math.floor(x)
+
 
 def shadow_occlusion(
     depth_map: Sequence[Sequence[float]],
@@ -47,7 +61,17 @@ def shadow_occlusion(
     values are not part of the contract.
     """
 
-    raise NotImplementedError
+    height = len(depth_map)
+    width = len(depth_map[0])
+    u, v = uv
+
+    col = min(max(int(math.floor(u * width)), 0), width - 1)
+    row = min(max(int(math.floor(v * height)), 0), height - 1)
+    stored = depth_map[row][col]
+
+    if depth > stored + bias + _DEPTH_TOLERANCE:
+        return 1.0
+    return 0.0
 
 
 def sample_steps(
@@ -73,7 +97,17 @@ def sample_steps(
     module; derive the per-cell value with ``math`` only.
     """
 
-    raise NotImplementedError
+    if n <= 0:
+        return []
+
+    jitter = min(max(jitter, 0.0), 1.0)
+    step = (t1 - t0) / n
+    samples = []
+    for i in range(n):
+        midpoint = t0 + (i + 0.5) * step
+        offset = (_hash01(seed, i) - 0.5) * jitter * step
+        samples.append(midpoint + offset)
+    return samples
 
 
 def phase_hg(cos_theta: float, g: float) -> float:
@@ -93,7 +127,12 @@ def phase_hg(cos_theta: float, g: float) -> float:
     ``1 / (4 * pi)`` within ``1e-9``.
     """
 
-    raise NotImplementedError
+    cos_theta = min(max(cos_theta, -1.0), 1.0)
+    g = min(max(g, -1.0 + _G_EPSILON), 1.0 - _G_EPSILON)
+
+    g2 = g * g
+    denom = 1.0 + g2 - 2.0 * g * cos_theta
+    return (1.0 - g2) / (4.0 * math.pi * denom ** 1.5)
 
 
 def shaft(
@@ -135,7 +174,36 @@ def shaft(
     The phase function is not optional: energy must fall off with distance.
     """
 
-    raise NotImplementedError
+    if n <= 0:
+        return 0.0
+
+    uv0 = ray["uv0"]
+    uv1 = ray["uv1"]
+    depth0 = float(ray["depth0"])
+    depth1 = float(ray["depth1"])
+    t0 = float(ray["t0"])
+    t1 = float(ray["t1"])
+    sigma_t = float(ray["sigma_t"])
+    jitter = float(ray.get("jitter", 0.0))
+    seed = int(ray.get("seed", 0))
+
+    intensity = float(light["intensity"])
+    phase = phase_hg(float(light["cos_theta"]), float(light["g"]))
+
+    step = (t1 - t0) / n
+    total = 0.0
+    for t in sample_steps(t0, t1, n, jitter, seed):
+        s = (t - t0) / (t1 - t0)
+        uv = (uv0[0] + (uv1[0] - uv0[0]) * s, uv0[1] + (uv1[1] - uv0[1]) * s)
+        depth = depth0 + (depth1 - depth0) * s
+        visibility = 1.0 - shadow_occlusion(depth_map, uv, depth, bias)
+        if visibility == 0.0:
+            continue
+        transmittance = math.exp(-sigma_t * (t - t0))
+        if transmittance == 0.0:
+            continue
+        total += visibility * transmittance
+    return step * total * intensity * phase
 
 
 def dither_offsets(n: int, seed: int) -> list[float]:
@@ -151,7 +219,9 @@ def dither_offsets(n: int, seed: int) -> list[float]:
     returns ``[]``.  Do not use the ``random`` module; use ``math`` only.
     """
 
-    raise NotImplementedError
+    if n <= 0:
+        return []
+    return [_hash01(seed, i) for i in range(n)]
 
 
 def energy_check(
@@ -172,7 +242,23 @@ def energy_check(
     contract; the normalization is what keeps the result from exceeding one.
     """
 
-    raise NotImplementedError
+    if not samples:
+        return 0.0
+
+    if isinstance(transmittance, (int, float)):
+        weights = [float(transmittance)] * len(samples)
+    else:
+        weights = list(transmittance)
+
+    total_weight = 0.0
+    weighted = 0.0
+    for sample, transmit in zip(samples, weights):
+        total_weight += sample
+        weighted += sample * transmit
+
+    if total_weight == 0.0:
+        return 0.0
+    return min(max(weighted / total_weight, 0.0), 1.0)
 
 
 def validate_shaft(
@@ -199,7 +285,66 @@ def validate_shaft(
     as a range error.  The function only validates; it does not integrate.
     """
 
-    raise NotImplementedError
+    messages: list[str] = []
+
+    def _is_finite_number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    # --- UV endpoints -----------------------------------------------------
+    for key in ("uv0", "uv1"):
+        value = ray.get(key)
+        if (
+            not isinstance(value, (tuple, list))
+            or len(value) != 2
+            or not all(isinstance(c, (int, float)) for c in value)
+        ):
+            messages.append(f"uv: {key} is malformed")
+            continue
+        if not all(math.isfinite(c) for c in value):
+            messages.append(f"nan: {key} is not finite")
+            continue
+        if not all(0.0 <= c <= 1.0 for c in value):
+            messages.append(f"uv: {key} is outside [0, 1]")
+
+    # --- Depth endpoints --------------------------------------------------
+    for key in ("depth0", "depth1"):
+        value = ray.get(key)
+        if not isinstance(value, (int, float)):
+            messages.append(f"depth: {key} is malformed")
+            continue
+        if not math.isfinite(value):
+            messages.append(f"nan: {key} is not finite")
+            continue
+        if not 0.0 <= value <= 1.0:
+            messages.append(f"depth: {key} is outside [0, 1]")
+
+    # --- Segment bounds ---------------------------------------------------
+    for key in ("t0", "t1"):
+        value = ray.get(key)
+        if not _is_finite_number(value):
+            messages.append(f"nan: {key} is not finite")
+
+    # --- Depth map --------------------------------------------------------
+    if not depth_map or not all(len(row) > 0 for row in depth_map):
+        messages.append("depth_map: map is empty")
+    else:
+        width = len(depth_map[0])
+        if any(len(row) != width for row in depth_map):
+            messages.append("depth_map: map is ragged")
+        saw_nan = False
+        saw_range = False
+        for row in depth_map:
+            for entry in row:
+                if not isinstance(entry, (int, float)) or not math.isfinite(entry):
+                    saw_nan = True
+                elif not 0.0 <= entry <= 1.0:
+                    saw_range = True
+        if saw_nan:
+            messages.append("nan: depth_map contains a non-finite value")
+        if saw_range:
+            messages.append("depth_map: value outside [0, 1]")
+
+    return messages
 
 
 def shaft_batch(
@@ -221,4 +366,10 @@ def shaft_batch(
     sequence returns ``{"values": [], "count": 0}``.
     """
 
-    raise NotImplementedError
+    depth_map = config["depth_map"]
+    light = config["light"]
+    n = config["n"]
+    bias = config["bias"]
+
+    values = [shaft(depth_map, ray, light, n, bias) for ray in rays]
+    return {"values": values, "count": len(rays)}
